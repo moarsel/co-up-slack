@@ -1,0 +1,27 @@
+{
+  "name": "co-up-slack",
+  "version": "0.0.1",
+  "description": "Collective decision making for slack",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.21.4",
+    "@supabase/supabase-js": "^2.45.4"
+  },
+  "engines": {
+    "node": "16.x"
+  },
+  "repository": {
+    "url": "https://github.com/moarsel/co-up-slack/new/main"
+  },
+  "license": "MIT",
+  "keywords": [
+    "node",
+    "glitch",
+    "express",
+    "slack",
+    "quadratic voting"
+  ]
+}
