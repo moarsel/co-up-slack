@@ -11,35 +11,6 @@ const app = new App({
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-async function createPollInDB(topic, options, channelId, endTime, hideVotes, startingTickets) {
-  const { data, error } = await supabase
-    .from('polls')
-    .insert({
-      topic,
-      options,
-      votes: options.map(() => ({})),
-      channel_id: channelId,
-      total_tokens: startingTickets * options.length,
-      user_tokens: {},
-      end_time: endTime ? new Date(endTime) : null,
-      hide_votes: hideVotes,
-      starting_tickets: startingTickets
-    })
-    .select();
-
-  if (error) throw error;
-  return data[0];
-}
-
-
-async function updatePollInDB(pollId, votes, totalTokens, userTokens) {
-  const { error } = await supabase
-    .from('polls')
-    .update({ votes, total_tokens: totalTokens, user_tokens: userTokens })
-    .eq('id', pollId);
-
-  if (error) throw error;
-}
 
 async function getPollFromDB(pollId) {
   const { data, error } = await supabase
@@ -52,14 +23,15 @@ async function getPollFromDB(pollId) {
   return data;
 }
 
-function calculateVoteCost(currentVotes) {
-  return (currentVotes + 1) ** 2 - currentVotes ** 2;
+function calculateTotalVoteCost(vote){ return vote * vote};
+
+function calculateNextVoteCost(currentVotes) {
+  return Math.abs((Math.abs(currentVotes) + 1) ** 2 - Math.abs(currentVotes) ** 2);
 }
 
 function getUserVotes(pollData, userId) {
   return pollData.options.map((_, index) => pollData.votes[index][userId] || 0);
 }
-
 app.command('/create_poll', async ({ ack, body, client }) => {
   await ack();
 
@@ -96,18 +68,6 @@ app.command('/create_poll', async ({ ack, body, client }) => {
           },
           {
             type: 'input',
-            block_id: 'starting_tickets_block',
-            element: {
-              type: 'number_input',
-              action_id: 'starting_tickets_input',
-              initial_value: '99',
-              min_value: '1',
-              is_decimal_allowed: false 
-            },
-            label: { type: 'plain_text', text: 'Starting Tickets' }
-          },
-          {
-            type: 'input',
             block_id: 'end_time_block',
             optional: true,
             element: {
@@ -133,7 +93,7 @@ app.command('/create_poll', async ({ ack, body, client }) => {
             label: { type: 'plain_text', text: 'Vote Visibility' }
           }
         ],
-        private_metadata: JSON.stringify({ channel_id: body.channel_id })
+        private_metadata: JSON.stringify({ channel_id: body.channel_id, user_id: body.user_id })
       }
     });
   } catch (error) {
@@ -141,10 +101,44 @@ app.command('/create_poll', async ({ ack, body, client }) => {
   }
 });
 
+async function createPollInDB(topic, options, channelId, endTime, hideVotes, creatorId) {
+  const ticketMultiplier = process.env.TICKET_MULTIPLIER || 5;
+  const flexibilityFactor = process.env.FLEXIBILITY_FACTOR || 1;
+  const startingTickets = Math.round(ticketMultiplier * Math.sqrt(options.length) * flexibilityFactor);
+
+  const { data, error } = await supabase
+    .from('polls')
+    .insert({
+      topic,
+      options,
+      votes: options.map(() => ({})),
+      channel_id: channelId,
+      starting_tickets: startingTickets,
+      user_tokens: {},
+      end_time: endTime ? new Date(endTime) : null,
+      hide_votes: hideVotes,
+      creator_id: creatorId
+    })
+    .select();
+
+  if (error) throw error;
+  return data[0];
+}
+
+async function updatePollInDB(pollId, votes, userTokens) {
+  const { error } = await supabase
+    .from('polls')
+    .update({ votes, user_tokens: userTokens })
+    .eq('id', pollId);
+
+  if (error) throw error;
+}
+
+// Update the view submission handler
 app.view('create_poll_modal', async ({ ack, body, view, client }) => {
   await ack();
 
-  const { channel_id } = JSON.parse(view.private_metadata);
+  const { channel_id, user_id } = JSON.parse(view.private_metadata);
   const topic = view.state.values.topic_block.topic_input.value;
   const options = view.state.values.options_block.options_input.value.split('\n').filter(option => option.trim() !== '');
   
@@ -154,10 +148,8 @@ app.view('create_poll_modal', async ({ ack, body, view, client }) => {
   const hideVotesBlock = view.state.values.hide_votes_block;
   const hideVotes = hideVotesBlock && hideVotesBlock.hide_votes_input.selected_options.length > 0;
 
-  const startingTickets = parseInt(view.state.values.starting_tickets_block.starting_tickets_input.value) || 99;
-
   try {
-    const pollData = await createPollInDB(topic, options, channel_id, endTime, hideVotes, startingTickets);
+    const pollData = await createPollInDB(topic, options, channel_id, endTime, hideVotes, user_id);
     await postPollMessage(client, pollData);
     console.log('Poll created successfully');
   } catch (error) {
@@ -170,14 +162,13 @@ app.action('vote_button', async ({ ack, body, client }) => {
 
   try {
     const pollId = body.message.metadata.event_payload.poll_id;
+    const creatorId = body.message.metadata.event_payload.creator_id;
     const userId = body.user.id;
-    const pollData = await getPollFromDB(pollId);
+    let pollData = await getPollFromDB(pollId);
 
     const now = new Date();
     if (pollData.end_time && now >= new Date(pollData.end_time)) {
-      // If the poll has ended, update the message to show final results
       await updatePollMessage(client, pollData);
-      // Notify the user that voting has ended
       await client.views.open({
         trigger_id: body.trigger_id,
         view: {
@@ -196,25 +187,35 @@ app.action('vote_button', async ({ ack, body, client }) => {
         }
       });
     } else {
-      // If the poll is still active, open the voting modal
-      await openVoteModal(client, body.trigger_id, pollData, userId);
+      const result = await client.views.open({
+        trigger_id: body.trigger_id,
+        view: {
+          type: 'modal',
+          callback_id: 'vote_modal',
+          title: { type: 'plain_text', text: 'Cast Your Votes' },
+          close: { type: 'plain_text', text: 'Close' },
+          blocks: [] // We'll fill this in openVoteModal
+        }
+      });
+      pollData.view_id = result.view.id; // Store the view_id
+      await openVoteModal(client, body.trigger_id, pollData, userId, creatorId);
     }
   } catch (error) {
     console.error('Error opening vote modal:', error);
   }
 });
 
-async function openVoteModal(client, triggerId, pollData, userId) {
+async function openVoteModal(client, triggerId, pollData, userId, creatorId) {
   const userVotes = getUserVotes(pollData, userId);
   const userTokens = pollData.user_tokens[userId] ?? pollData.starting_tickets;
-  console.log('tokens', pollData.user_tokens[userId])
 
-  const modalBlocks = [
+
+  let modalBlocks = [
     {
       "type": "header",
       "text": {
         "type": "plain_text",
-        "text": `${pollData.topic}`,
+        "text": `Topic: ${pollData.topic}`,
         "emoji": true
       }
     },
@@ -222,125 +223,129 @@ async function openVoteModal(client, triggerId, pollData, userId) {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `_You have :admission_tickets: ${userTokens} tickets remaining._`
+        text: `_You have :admission_tickets: ${userTokens} tickets to spend._`
       }
-    },
-    ...pollData.options.map((option, index) => {
-      const currentVotes = userVotes[index];
-      const voteCost = calculateVoteCost(currentVotes);
-      const totalVotes = Object.values(pollData.votes[index]).reduce((a, b) => a + b, 0);
-      return {
+    }
+  ];
+
+  pollData.options.forEach((option, index) => {
+    const currentVotes = userVotes[index];
+    const voteCost = calculateNextVoteCost(currentVotes);
+    const totalVotes = Object.values(pollData.votes[index]).reduce((a, b) => a + b, 0);
+
+    modalBlocks = modalBlocks.concat([
+      {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: `*:ballot_box_with_ballot: ${totalVotes} votes:* ${option}`
-        },
-        accessory: {
-          type: 'button',
-          text: { type: 'plain_text', text: `Vote (${voteCost} :admission_tickets:)`, emoji: true },
-          value: `${pollData.id}|${index}`,
-          action_id: `cast_vote_${index}`
+          text: `> * ${option}*\n ${currentVotes ? `:ballot_box_with_ballot: ${currentVotes} vote${Math.abs(currentVotes) > 1 ? 's' : ''}` : ''}`
         }
-      };
-    })
-  ];
-
-  await client.views.open({
-    trigger_id: triggerId,
-    view: {
-      type: 'modal',
-      callback_id: 'vote_modal',
-      title: { type: 'plain_text', text: 'Cast Your Votes' },
-      close: { type: 'plain_text', text: 'Close' },
-      blocks: modalBlocks
-    }
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: `:heavy_plus_sign: Upvote`, emoji: true },
+            value: `${pollData.id}|${index}|add`,
+            action_id: `cast_vote_${index}_add`
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: `:heavy_minus_sign: Downvote`, emoji: true },
+            value: `${pollData.id}|${index}|subtract`,
+            action_id: `cast_vote_${index}_subtract`
+          }
+        ]
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `Next vote costs ${voteCost} :admission_tickets:`
+          }
+        ]
+      },
+      {type: 'divider'}
+    ]);
   });
+
+  if (userId === creatorId) {
+    modalBlocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'End Voting', emoji: true },
+          style: 'danger',
+          value: `${pollData.id}`,
+          action_id: 'end_voting'
+        }
+      ]
+    });
+  }
+
+  try {
+    await client.views.update({
+      view_id: pollData.view_id, // We need to store this when opening the modal
+      view: {
+        type: 'modal',
+        callback_id: 'vote_modal',
+        title: { type: 'plain_text', text: 'Cast Your Votes' },
+        close: { type: 'plain_text', text: 'Close' },
+        blocks: modalBlocks
+      }
+    });
+  } catch (error) {
+    console.error('Error updating vote modal:', error);
+    // If updating fails, open a new modal
+    await client.views.open({
+      trigger_id: triggerId,
+      view: {
+        type: 'modal',
+        callback_id: 'vote_modal',
+        title: { type: 'plain_text', text: 'Cast Your Votes' },
+        close: { type: 'plain_text', text: 'Close' },
+        blocks: modalBlocks
+      }
+    });
+  }
 }
 
-app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
+app.action(/^cast_vote_\d+_(add|subtract)$/, async ({ ack, body, client, action }) => {
   await ack();
 
   try {
-    const [pollId, optionIndex] = action.value.split('|');
+    const [pollId, optionIndex, voteType] = action.value.split('|');
     const userId = body.user.id;
     const pollData = await getPollFromDB(pollId);
-    
-    const userVotes = getUserVotes(pollData, userId);
-    const currentVotes = userVotes[optionIndex];
-    const voteCost = calculateVoteCost(currentVotes);
     
     if (!pollData.user_tokens[userId]) {
       pollData.user_tokens[userId] = pollData.starting_tickets;
     }
 
+    const currentVotes = pollData.votes[optionIndex][userId] || 0;
     const userTokensLeft = pollData.user_tokens[userId];
-
-    if (userTokensLeft >= voteCost) {
-      if (!pollData.votes[optionIndex][userId]) {
-        pollData.votes[optionIndex][userId] = 0;
-      }
-      pollData.votes[optionIndex][userId]++;
-      pollData.user_tokens[userId] -= voteCost;
-      pollData.total_tokens -= voteCost;
-
-      await updatePollInDB(pollId, pollData.votes, pollData.total_tokens, pollData.user_tokens);
-      await updatePollMessage(client, pollData);
-
-      // Update the vote modal
-      const updatedModalBlocks = [
-        {
-          "type": "header",
-          "text": {
-            "type": "plain_text",
-            "text": `${pollData.topic}`,
-            "emoji": true
-          }
-        },
-        {
-          type: 'section',
-          text: {
-            type: 'mrkdwn',
-            text: `_You have :admission_tickets: ${pollData.user_tokens[userId]} tickets remaining._`
-          }
-        },
-        ...pollData.options.map((option, index) => {
-          const updatedUserVotes = getUserVotes(pollData, userId);
-          const updatedCurrentVotes = updatedUserVotes[index];
-          const updatedVoteCost = calculateVoteCost(updatedCurrentVotes);
-          const totalVotes = Object.values(pollData.votes[index]).reduce((a, b) => a + b, 0);
-          return {
-            type: 'section',
-            text: {
-              type: 'mrkdwn',
-              text: `*:ballot_box_with_ballot: ${totalVotes} votes: * ${option}`
-            },
-            accessory: {
-              type: 'button',
-              text: { type: 'plain_text', text: `Vote (${updatedVoteCost} :admission_tickets:)`, emoji: true },
-              value: `${pollId}|${index}`,
-              action_id: `cast_vote_${index}`
-            }
-          };
-        })
-      ];
-
-      await client.views.update({
-        view_id: body.view.id,
-        view: {
-          type: 'modal',
-          callback_id: 'vote_modal',
-          title: { type: 'plain_text', text: 'Cast Your Votes' },
-          close: { type: 'plain_text', text: 'Close' },
-          blocks: updatedModalBlocks
-        }
-      });
+    
+    let newVotes = currentVotes;
+    if (voteType === 'add') {
+      newVotes++;
     } else {
+      newVotes--;
+    }
+
+    const currentCost = calculateTotalVoteCost(Math.abs(currentVotes));
+    const newCost = calculateTotalVoteCost(Math.abs(newVotes));
+    const voteCost = newCost - currentCost;
+
+    if (voteCost > userTokensLeft) {
       // Notify the user about insufficient tokens
       await client.views.update({
         view_id: body.view.id,
         view: {
           type: 'modal',
-          title: { type: 'plain_text', text: 'Insufficient Tokens' },
+          title: { type: 'plain_text', text: 'Action Not Allowed' },
           close: { type: 'plain_text', text: 'Close' },
           blocks: [
             {
@@ -353,15 +358,66 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
           ]
         }
       });
+      return;
     }
+
+    // Update votes and tokens
+    pollData.votes[optionIndex][userId] = newVotes;
+    pollData.user_tokens[userId] -= voteCost;
+
+    await updatePollInDB(pollId, pollData.votes, pollData.user_tokens);
+    await updatePollMessage(client, pollData);
+
+    pollData.view_id = body.view.id; 
+    await openVoteModal(client, body.trigger_id, pollData, userId, pollData.creator_id);
   } catch (error) {
     console.error('Error processing vote:', error);
   }
 });
 
-  function getPollMessagePayload(pollData) {
+app.action('end_voting', async ({ ack, body, client }) => {
+  await ack();
+
+  try {
+    const pollId = body.actions[0].value;
+    const pollData = await getPollFromDB(pollId);
+
+    if (body.user.id === pollData.creator_id) {
+      await supabase
+        .from('polls')
+        .update({ end_time: new Date().toISOString() })
+        .eq('id', pollId);
+
+      pollData.end_time = new Date();
+      await updatePollMessage(client, pollData);
+
+      await client.views.update({
+        view_id: body.view.id,
+        view: {
+          type: 'modal',
+          title: { type: 'plain_text', text: 'Voting Ended' },
+          close: { type: 'plain_text', text: 'Close' },
+          blocks: [
+            {
+              type: 'section',
+              text: {
+                type: 'mrkdwn',
+                text: 'You have successfully ended the voting for this poll.'
+              }
+            }
+          ]
+        }
+      });
+    } else {
+      console.error('Unauthorized attempt to end voting');
+    }
+  } catch (error) {
+    console.error('Error ending voting:', error);
+  }
+});
+
+function getPollMessagePayload(pollData) {
   const now = new Date();
-    
   const endTime = pollData.end_time ? new Date(pollData.end_time) : null;
   const isEnded = endTime && now >= endTime;
 
@@ -376,7 +432,6 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
   ];
 
   if (isEnded) {
-    // Sort options by votes
     const sortedOptions = pollData.options
       .map((option, index) => ({
         option,
@@ -388,20 +443,19 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `*:ballot_box_with_ballot: ${votes} votes:* ${option}`
+        text: `${option}\n*:ballot_box_with_ballot: ${votes} votes*`
       }
     })));
 
-   blocks.push({
+    blocks.push({
       type: 'context',
       elements: [
         {
           type: 'mrkdwn',
-          text: `Poll ended <!date^${new Date(endTime).getTime() / 1000}^{date} at {time}|${endTime.toLocaleString()}>`
+          text: `Poll ended <!date^${Math.floor(endTime.getTime() / 1000)}^{date} at {time}|${endTime.toLocaleString()}>`
         }
       ]
     });
-      
   } else {
     blocks = blocks.concat(pollData.options.map((option, index) => {
       const optionVotes = Object.values(pollData.votes[index]).reduce((a, b) => a + b, 0);
@@ -411,7 +465,7 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
           type: 'mrkdwn',
           text: pollData.hide_votes
             ? `${option}`
-            : `*:ballot_box_with_ballot: ${optionVotes} votes:* ${option}`
+            : `${option}\n*:ballot_box_with_ballot: ${optionVotes} votes*`
         }
       };
     }));
@@ -431,21 +485,19 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
         }
       ]
     });
-  
 
-  
-    
-     blocks.push({
-      type: 'context',
-      elements: [
-        {
-          type: 'mrkdwn',
-          text: endTime ? `Poll ends at <!date^${new Date(endTime).getTime() / 1000}^{date} at {time}|${endTime.toLocaleString()}>` : 'This poll has no end time'
-        }
-      ]
-    });
+    if (endTime) {
+      blocks.push({
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `Poll ends at <!date^${Math.floor(endTime.getTime() / 1000)}^{date} at {time}|${endTime.toLocaleString()}>`
+          }
+        ]
+      });
+    }
   }
-
 
   return {
     channel: pollData.channel_id,
@@ -454,7 +506,8 @@ app.action(/^cast_vote_\d+$/, async ({ ack, body, client, action }) => {
     metadata: {
       event_type: "poll_update",
       event_payload: {
-        poll_id: pollData.id
+        poll_id: pollData.id,
+        creator_id: pollData.creator_id
       }
     }
   };
@@ -469,7 +522,6 @@ async function updatePollMessage(client, pollData) {
   const now = new Date();
   const endTime = pollData.end_time ? new Date(pollData.end_time) : null;
   const isEnded = endTime && now >= endTime;
-
 
   try {
     await client.chat.update({
